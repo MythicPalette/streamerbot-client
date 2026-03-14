@@ -196,7 +196,20 @@ export class StreamerbotClient {
       controller.abort();
     }, { once: true });
 
-    return await withTimeout(new Promise<void>(async (res, rej) => {
+	let onOpenMessage: (() => any) | null = null;
+	let onCloseMessage: (() => any) | null = null;
+	try {
+		await withTimeout(
+			new Promise<void>(async (res, rej) => {
+				onOpenMessage = () => {
+					if (!this.socket)
+						return rej(new Error("WebSocket not initialized"));
+					res();
+				};
+				
+				onCloseMessage = () => {
+					return rej(new Error("WebSocket closed"));
+				};
       try {
         if (this.options.password) this._authEnabled = true;
 
@@ -210,14 +223,13 @@ export class StreamerbotClient {
         this.socket.onclose = this.onClose.bind(this);
         this.socket.onerror = this.onError.bind(this);
 
-        this.socket.addEventListener('open', () => {
-          if (!this.socket) return rej(new Error('WebSocket not initialized'));
-          res();
-        }, { signal: controller.signal });
+					this.socket.addEventListener("open", onOpenMessage, {
+						signal: controller.signal,
+					});
 
-        this.socket.addEventListener('close', () => {
-          return rej(new Error('WebSocket closed'));
-        }, { once: true });
+					this.socket.addEventListener("close", onCloseMessage, {
+						once: true,
+					});
       } catch (error) {
         try {
           await this.disconnect();
@@ -227,11 +239,25 @@ export class StreamerbotClient {
         }
         rej(error);
       }
-    }), {
+			}),
+			{
       timeout,
       message: 'WebSocket connection timeout exceeded',
       controller,
-    });
+			},
+		);
+	} catch (error) {
+		this?.options?.onError?.(error as Error);
+		throw error;
+	} finally {
+		if (onOpenMessage)
+			this.socket?.removeEventListener("open", onOpenMessage);
+		if (onCloseMessage)
+			this.socket?.removeEventListener("close", onCloseMessage);
+		controller.abort();
+	}
+	
+	return;
   }
 
   /**
@@ -276,11 +302,20 @@ export class StreamerbotClient {
       controller.abort();
     }, { once: true, signal });
 
+	let messageHandler: ((event: any) => any) | null = null;
     const response = await withTimeout(
-      new Promise<StreamerbotHelloRequest | StreamerbotInfo>((res, rej) => {
-        this.socket?.addEventListener('message', async (event: any) => {
-          if (!('data' in event) || !event.data || typeof event.data !== 'string') {
-            this.logger?.debug('Unknown message received', event);
+		new Promise<StreamerbotHelloRequest | StreamerbotInfo>(
+			(res, rej) => {
+				messageHandler = async (event: any) => {
+					if (
+						!("data" in event) ||
+						!event.data ||
+						typeof event.data !== "string"
+					) {
+						this.logger?.debug(
+							"Unknown message received",
+							event,
+						);
             return;
           }
 
@@ -293,14 +328,22 @@ export class StreamerbotClient {
             this.logger?.warn('Invalid JSON payload received', event.data);
             rej(e);
           }
-        }, { signal });
-      }),
+				};
+				
+				this.socket?.addEventListener("message", messageHandler, {
+					signal,
+				});
+			},
+		),
       {
         timeout: 5_000,
         message: 'Handshake timeout exceeded',
         controller,
       }
     );
+
+	if (messageHandler)
+		this.socket?.removeEventListener("message", messageHandler);
 
     if (!response || !('info' in response)) throw new Error('Handshake failed (invalid payload)');
 
@@ -549,10 +592,19 @@ export class StreamerbotClient {
       controller.abort();
     }, { once: true, signal });
 
-    const response = await withTimeout(new Promise<T>((res, rej) => {
-      this.socket?.addEventListener('message', (event: any) => {
-        if (!('data' in event) || !event.data || typeof event.data !== 'string') {
-          this.logger?.debug('Unknown message received', event.data);
+	let messageHandler: ((event: any) => any) | null = null;
+	const response = await withTimeout(
+		new Promise<T>((res, rej) => {
+			messageHandler = (event: any) => {
+				if (
+					!("data" in event) ||
+					!event.data ||
+					typeof event.data !== "string"
+				) {
+					this.logger?.debug(
+						"Unknown message received",
+						event.data,
+					);
           return;
         }
 
@@ -566,15 +618,25 @@ export class StreamerbotClient {
           this.logger?.warn('Invalid JSON payload received', event.data);
           rej(e);
         }
-      }, { signal });
-      this.logger?.verbose(`SEND :: ${request.request}`, { ...request, id });
+			};
+			
+			this.socket?.addEventListener("message", messageHandler, {
+				signal,
+			});
+			this.logger?.verbose(`SEND :: ${request.request}`, {
+				...request,
+				id,
+			});
       this.send({ ...request, id });
     }), {
       timeout,
       message: 'Request timed out',
       controller,
       signal,
-    });
+		},
+	);
+	if (messageHandler)
+		this.socket?.removeEventListener("message", messageHandler);
 
     if (response?.status === 'ok') {
       // onData handler
